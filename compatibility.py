@@ -6,6 +6,74 @@ from config import CLEAN_VALUE, DIRTY_VALUE
 from models import Flow, Site, VehicleType
 
 
+def _norm_status(value: str | None) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _status_matches(value: str | None, expected: str) -> bool:
+    return _norm_status(value) == expected
+
+
+def _status_set(flows: list[Flow]) -> set[str]:
+    return {_norm_status(f.clean_dirty) for f in flows if _norm_status(f.clean_dirty)}
+
+
+def _flow_allows_co_load(flow: Flow, other_statuses: set[str]) -> tuple[bool, str]:
+    """Vérifie si un flux peut cohabiter simultanément avec des statuts chargés."""
+    own_status = _norm_status(flow.clean_dirty)
+    statuses = {s for s in other_statuses if s and s != own_status}
+    if not statuses:
+        return True, ""
+    if not flow.mixed_allowed:
+        return False, f"Flux {flow.object_key} n'autorise pas le transport mixte simultané"
+    exclusion = _norm_status(flow.mixed_exclusion)
+    if exclusion and exclusion in statuses:
+        return False, f"Flux {flow.object_key} exclut le chargement simultané avec le statut {flow.mixed_exclusion}"
+    return True, ""
+
+
+def simultaneous_load_sanitary_compatible(load: list[Flow]) -> tuple[bool, str]:
+    """Contrôle la compatibilité sanitaire des flux présents en même temps dans le véhicule.
+
+    On ne rejette plus une tournée parce qu'elle contient à la fois du propre et du sale :
+    c'est autorisé si ces statuts ne sont pas transportés simultanément, par exemple une
+    livraison propre puis un retour sale après déchargement. Le contrôle strict est donc
+    réalisé sur la charge courante, pas sur toute la tournée.
+    """
+    statuses = _status_set(load)
+    if CLEAN_VALUE not in statuses or DIRTY_VALUE not in statuses:
+        return True, ""
+    for flow in load:
+        ok, reason = _flow_allows_co_load(flow, statuses)
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+def vehicle_state_can_load(current_state: str, flows_to_load: list[Flow], current_site: str, depot: str) -> tuple[bool, str, bool]:
+    """Vérifie l'état sanitaire du véhicule avant chargement.
+
+    Retourne (ok, raison, disinfection_needed). Une désinfection est possible uniquement
+    au stationnement initial et seulement si le véhicule est vide ; elle sera matérialisée
+    dans la timeline par route_builder.
+    """
+    statuses = _status_set(flows_to_load)
+    if CLEAN_VALUE in statuses and _norm_status(current_state) == DIRTY_VALUE:
+        if current_site == depot:
+            return True, "", True
+        return False, "Véhicule sale : retour au stationnement initial requis avant chargement propre", False
+    return True, "", False
+
+
+def flows_sanitary_compatible(flows: list[Flow]) -> tuple[bool, str]:
+    """Compatibilité minimale, conservée pour les cas de co-chargement simultané.
+
+    Cette fonction ne doit pas être utilisée pour rejeter toute une tournée mixte propre/sale,
+    car une tournée peut être valide si le propre est livré avant la collecte du sale.
+    """
+    return simultaneous_load_sanitary_compatible(flows)
+
+
 def vehicle_can_operate_site(vehicle: VehicleType, site: Site) -> tuple[bool, str]:
     if not site.vehicle_compat.get(vehicle.type, False):
         return False, f"{vehicle.type} incompatible avec le site {site.name} selon param Sites"
@@ -33,20 +101,6 @@ def vehicle_compatible_with_flow(vehicle: VehicleType, flow: Flow, sites: dict[s
         ok, reason = vehicle_can_operate_site(vehicle, site)
         if not ok:
             return False, reason
-    return True, ""
-
-
-def flows_sanitary_compatible(flows: list[Flow]) -> tuple[bool, str]:
-    """Vérifie les règles de mixité propre/sale dans un même circuit."""
-    statuses = {str(f.clean_dirty).strip().casefold() for f in flows}
-    if CLEAN_VALUE in statuses and DIRTY_VALUE in statuses:
-        for flow in flows:
-            exclusion = (flow.mixed_exclusion or "").strip().casefold()
-            status = str(flow.clean_dirty).strip().casefold()
-            if not flow.mixed_allowed:
-                return False, f"Flux {flow.object_key} n'autorise pas le transport mixte"
-            if exclusion and exclusion in statuses and exclusion != status:
-                return False, f"Flux {flow.object_key} exclut le statut sanitaire {flow.mixed_exclusion}"
     return True, ""
 
 

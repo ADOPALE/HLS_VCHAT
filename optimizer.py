@@ -15,8 +15,8 @@ from dataclasses import dataclass
 from typing import Callable, Iterable
 
 from capacity import load_ok, max_containers_for_flow
-from compatibility import compatible_vehicles_for_flow, flows_sanitary_compatible, vehicle_compatible_with_flow
-from config import DEFAULT_OPTIM_TIME_LIMIT_SEC, EPS, MAX_GAP_HORAIRE_CIRCUIT
+from compatibility import compatible_vehicles_for_flow, simultaneous_load_sanitary_compatible, vehicle_state_can_load, vehicle_compatible_with_flow
+from config import CLEAN_VALUE, DEFAULT_OPTIM_TIME_LIMIT_SEC, DIRTY_VALUE, DISINFECTION_MIN, EPS, MAX_GAP_HORAIRE_CIRCUIT
 from data_loader import OptiFluxData
 from exceptions import Diagnostic, InfeasibleProblemError, OptimizationError
 from models import Flow, RoutePDTW, VehicleType, VisiteSite
@@ -106,9 +106,10 @@ class Optimizer:
         candidates: list[tuple[float, RoutePDTW]] = []
         for route in routes:
             if all(vehicle_compatible_with_flow(route.vehicle, f, self.data.sites)[0] for f in group):
-                ok, reason = flows_sanitary_compatible(route.flux + group)
-                if ok:
-                    candidates.append((self._incremental_distance_hint(route, group), route))
+                # La compatibilité sanitaire dépend de l'ordre réel des chargements/déchargements.
+                # Elle est donc contrôlée dans evaluate_route(), et non par simple présence
+                # de flux propres et sales dans la même tournée.
+                candidates.append((self._incremental_distance_hint(route, group), route))
         candidates.sort(key=lambda x: x[0])
         for _, route in candidates:
             clone = route.clone()
@@ -129,9 +130,7 @@ class Optimizer:
         feasible_vehicles: list[VehicleType] = []
         for vehicle in vehicles:
             if all(vehicle_compatible_with_flow(vehicle, f, self.data.sites)[0] for f in group):
-                ok, _ = flows_sanitary_compatible(group)
-                if ok:
-                    feasible_vehicles.append(vehicle)
+                feasible_vehicles.append(vehicle)
         if not feasible_vehicles:
             reasons = []
             for vehicle in vehicles:
@@ -145,12 +144,15 @@ class Optimizer:
         feasible_vehicles.sort(key=lambda v: (v.floor_area_m2, v.max_weight_t, v.fuel_cost_per_km, v.type))
         best_route: RoutePDTW | None = None
         best_cost = float("inf")
+        vehicle_failures: list[str] = []
         for vehicle in feasible_vehicles:
             route = RoutePDTW(route_id=f"R{self.route_seq:04d}", vehicle=vehicle)
             ok = True
+            failed_flow: Flow | None = None
             for flow in group:
                 if not self._insert_single_flow_best(route, flow):
                     ok = False
+                    failed_flow = flow
                     break
             if ok:
                 ev = self.evaluate_route(route)
@@ -161,11 +163,42 @@ class Optimizer:
                         best_cost = cost
                         best_route = route.clone()
                         self._apply_eval(best_route, ev)
+                else:
+                    vehicle_failures.append(f"{vehicle.type}: {ev.reason}")
+            else:
+                detail = self._diagnose_failed_insertion(vehicle, group, failed_flow)
+                vehicle_failures.append(f"{vehicle.type}: impossible d'insérer {failed_flow.object_key if failed_flow else 'un flux'} ({detail})")
         if best_route is None:
             msg = "; ".join(f.object_key for f in group)
-            raise InfeasibleProblemError([Diagnostic("M flux", group[0].row_excel, None, "CRITIQUE", "INSERTION_IMPOSSIBLE", f"Impossible de construire une tournée valide pour le groupe : {msg}")])
+            detail = " | ".join(vehicle_failures[:8])
+            raise InfeasibleProblemError([Diagnostic("M flux", group[0].row_excel, None, "CRITIQUE", "INSERTION_IMPOSSIBLE", f"Impossible de construire une tournée valide pour le groupe : {msg}. Véhicules compatibles testés mais non retenus : {detail}")])
         self.route_seq += 1
         return best_route
+
+
+    def _diagnose_failed_insertion(self, vehicle: VehicleType, group: list[Flow], failed_flow: Flow | None) -> str:
+        """Fournit une explication métier courte quand un véhicule compatible ne permet pas d'insérer tout un groupe."""
+        if failed_flow is None:
+            return "contrainte non identifiée"
+        container = self.data.containers[failed_flow.container_type]
+        cap = max_containers_for_flow(vehicle, container, failed_flow)
+        same_origin_ready = [
+            f for f in group
+            if f is not failed_flow
+            and f.origin == failed_flow.origin
+            and f.container_type == failed_flow.container_type
+            and abs(f.ready_time - failed_flow.ready_time) <= EPS
+        ]
+        if same_origin_ready:
+            total_qty = failed_flow.quantity + sum(f.quantity for f in same_origin_ready)
+            if total_qty > cap:
+                return (
+                    f"capacité instantanée insuffisante si co-chargement depuis {failed_flow.origin}: "
+                    f"{total_qty} {failed_flow.container_type} à charger, capacité {cap} pour {vehicle.type}. "
+                    "Un retour au point d'origine entre deux livraisons peut aussi être incompatible avec les fenêtres horaires."
+                )
+        window = failed_flow.due_time - failed_flow.ready_time
+        return f"fenêtre {window} min, contraintes de capacité / ordre pickup-delivery / horaires trop fortes pour ce groupe mutualisé"
 
     def _insert_single_flow_best(self, route: RoutePDTW, flow: Flow) -> bool:
         best: tuple[float, list[VisiteSite], RouteEval] | None = None
@@ -249,9 +282,6 @@ class Optimizer:
         if not route.visites:
             return RouteEval(True, start_min=self.data.rh.start_min, end_min=self.data.rh.start_min, duration_min=0)
         all_flows = route.flux
-        ok, reason = flows_sanitary_compatible(all_flows)
-        if not ok:
-            return RouteEval(False, reason)
         ready_times = [f.ready_time for f in all_flows]
         if max(ready_times) - min(ready_times) > self.max_gap:
             return RouteEval(False, f"Écart entre heures de disponibilité > {self.max_gap} min")
@@ -301,6 +331,9 @@ class Optimizer:
                 load.remove(f)
             # charge
             load.extend(visit.flux_charges)
+            sanitary_ok, sanitary_reason = simultaneous_load_sanitary_compatible(load)
+            if not sanitary_ok:
+                return RouteEval(False, sanitary_reason)
             cap_ok, cap_reason, _, _ = load_ok(route.vehicle, self.data.containers, load)
             if not cap_ok:
                 return RouteEval(False, cap_reason)

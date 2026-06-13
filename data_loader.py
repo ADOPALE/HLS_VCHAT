@@ -104,11 +104,55 @@ def _to_minutes(value: Any, *, default: int | None = None, field: str = "horaire
         raise ValueError(f"Format horaire non reconnu pour {field}: {s}") from exc
 
 
+def _to_minutes_float(value: Any, *, default: float | None = None, field: str = "horaire") -> float:
+    """Convertit un horaire/durée Excel en minutes, en conservant les secondes.
+
+    Important pour les durées de manutention du modèle, souvent saisies comme
+    00:00:15 ou 00:00:30 : cela représente 0,25 ou 0,50 minute, pas zéro.
+    """
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        if default is not None:
+            return float(default)
+        raise ValueError(f"Valeur horaire absente pour {field}")
+    if isinstance(value, time):
+        return value.hour * 60 + value.minute + value.second / 60 + value.microsecond / 60_000_000
+    if isinstance(value, datetime):
+        return value.hour * 60 + value.minute + value.second / 60 + value.microsecond / 60_000_000
+    if isinstance(value, pd.Timestamp):
+        return value.hour * 60 + value.minute + value.second / 60 + value.microsecond / 60_000_000
+    if isinstance(value, (int, float)):
+        if 0 <= float(value) <= 1:
+            return float(value) * 1440
+        return float(value)
+    s = _safe_str(value)
+    if s is None:
+        if default is not None:
+            return float(default)
+        raise ValueError(f"Valeur horaire absente pour {field}")
+    if _ns(s) in NC_VALUES:
+        raise ValueError(f"NC n'est pas un horaire pour {field}")
+    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", s):
+        parts = [int(x) for x in s.split(":")]
+        if len(parts) == 2:
+            h, m = parts
+            sec = 0
+        else:
+            h, m, sec = parts
+        return h * 60 + m + sec / 60
+    try:
+        x = float(s.replace(",", "."))
+        if 0 <= x <= 1:
+            return x * 1440
+        return x
+    except ValueError as exc:
+        raise ValueError(f"Format horaire non reconnu pour {field}: {s}") from exc
+
+
 def _to_optional_duration_minutes(value: Any) -> float | None:
     s = _safe_str(value)
     if s is None or _ns(s) in NC_VALUES:
         return None
-    return float(_to_minutes(value, default=0, field="durée"))
+    return _to_minutes_float(value, default=0.0, field="durée")
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -320,9 +364,9 @@ def parse_vehicles(df: pd.DataFrame, cols: dict[str, str], containers: dict[str,
             co2_kg_per_km=_num(row.get(cols["vehicle_co2"]), 0.0),
             has_tail_lift=_to_bool(row.get(cols["vehicle_tail_lift"]), default=False),
             container_compat=compat,
-            dock_time_min=_to_minutes(row.get(cols["vehicle_dock_time"]), default=0, field="Temps de mise à quai"),
+            dock_time_min=_to_minutes_float(row.get(cols["vehicle_dock_time"]), default=0.0, field="Temps de mise à quai"),
             manual_no_dock_min_per_container=_to_optional_duration_minutes(row.get(cols["vehicle_manual_no_dock"])),
-            manual_dock_min_per_container=float(_to_minutes(row.get(cols["vehicle_manual_dock"]), default=0, field="Manutention avec quai")),
+            manual_dock_min_per_container=_to_minutes_float(row.get(cols["vehicle_manual_dock"]), default=0.0, field="Manutention avec quai"),
         )
     return vehicles
 

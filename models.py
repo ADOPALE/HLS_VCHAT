@@ -43,7 +43,7 @@ class VehicleType(BaseModel):
     co2_kg_per_km: float = 0.0
     has_tail_lift: bool = False
     container_compat: dict[str, bool] = Field(default_factory=dict)
-    dock_time_min: int = 0
+    dock_time_min: float = 0.0
     manual_no_dock_min_per_container: float | None = None
     manual_dock_min_per_container: float = 0.0
     enabled: bool = True
